@@ -34,4 +34,16 @@ def ping(
 ) -> bool:
     if not has_perms(app, channel_id, user_id):
         return False
-    raise NotImplementedError("Ping functionality is not implemented yet.")
+    app.client.chat_postMessage(
+        channel="C09BYASLGNM",
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"<!channel> {text}",
+                },
+            },
+        ],
+    )
+    return True
