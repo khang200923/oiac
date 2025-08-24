@@ -1,2 +1,4 @@
 slack_bolt==1.23.0
 python-dotenv==1.1.1
+psycopg2==2.9.10 
+pydapper==0.12.0
