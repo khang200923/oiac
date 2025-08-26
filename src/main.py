@@ -43,7 +43,7 @@ class ChanUserRel:
 app = App()
 client = app.client
 owner_id = os.getenv("OWNER_ID")
-domain = client.team_info(team="T1234567890").get("team", {})["domain"] # type: ignore
+domain = client.team_info().get("team", {})["domain"] # type: ignore
 assert domain is not None
 logger = get_logger(debug_log_file=Path(os.environ["LOG_FILE"]))
 
