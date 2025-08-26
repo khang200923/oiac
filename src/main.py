@@ -27,7 +27,7 @@ if not all(env in os.environ for env in required_envs):
     raise EnvironmentError(f"Missing required environment variable(s): {', '.join(missing)}")
 
 db_url = os.environ["DATABASE_URL"]
-channel_pattern = re.compile(r"<#(C\w+)(?:\|[^>]*)?>")
+channel_pattern = re.compile(r"<#([CG]\w+)(?:\|[^>]*)?>")
 user_pattern = re.compile(r"<@(U\w+)(?:\|[^>]*)?>")
 
 @dataclass
@@ -43,6 +43,8 @@ class ChanUserRel:
 app = App()
 client = app.client
 owner_id = os.getenv("OWNER_ID")
+domain = client.team_info(team="T1234567890").get("team", {})["domain"] # type: ignore
+assert domain is not None
 logger = get_logger(debug_log_file=Path(os.environ["LOG_FILE"]))
 
 def wrapper(func):
@@ -68,6 +70,8 @@ def is_a_member_in_private(channel_id: str) -> bool:
         return False
     channel = info["channel"]
     assert channel is not None
+    # if we can even find out the private channel, we are in it
+    # big brain moment
     return channel.get("is_private", False)
 
 def members_of(channel_id: str) -> list[str]:
@@ -150,8 +154,7 @@ def say_custom(channel_id: str, text: str, mimic_user_id: str):
     username = user["profile"].get("display_name", "")
     if username is None or username == "":
         username = user["profile"].get("real_name", "oiac")
-    else:
-        username = f"{username} (oiac)"
+    username = f"{username} (oiac)"
     return client.chat_postMessage(
         channel=channel_id,
         text=text,
@@ -159,17 +162,31 @@ def say_custom(channel_id: str, text: str, mimic_user_id: str):
         icon_url=icon_url
     )
 
-def invite_safe(channel_id: str, user_id: str):
+def invite_safe(channel_id: str, user_id: str) -> bool:
     try:
         client.conversations_invite(
             channel=channel_id,
             users=user_id
         )
+        return True
     except SlackApiError as e:
         error = e.response.get("error")
-        assert error is not None
         if error == "already_in_channel":
-            pass
+            return False
+        else:
+            raise e
+        
+def kick_safe(channel_id: str, user_id: str) -> bool:
+    try:
+        client.conversations_kick(
+            channel=channel_id,
+            user=user_id
+        )
+        return True
+    except SlackApiError as e:
+        error = e.response.get("error")
+        if error == "not_in_channel":
+            return False
         else:
             raise e
         
@@ -205,8 +222,11 @@ def handle_optin(ack, body, command, respond):
 Either someone kicked me out or there's a catastrophic failure.""")
             logger.warning("In /optin, bot not in ping channel %s", ping_channel_id)
             return
-    client.conversations_invite(channel=ping_channel_id, users=user_id)
-    respond(f":tw_white_check_mark: Opted in to oiac pings from <#{channel_id}|> via <#{ping_channel_id}|>")
+    invited = invite_safe(ping_channel_id, user_id)
+    if not invited:
+        respond(f":tw_warning: You are already in <#{ping_channel_id}>.")
+        return
+    respond(f":tw_white_check_mark: Opted in to oiac pings from <#{channel_id}> via <#{ping_channel_id}>")
     logger.info("In /optin, user %s opted in to channel %s", user_id, channel_id)
 
 @app.command("/optout")
@@ -233,8 +253,11 @@ def handle_optout(ack, body, command, respond):
 Either someone kicked me out or there's a catastrophic failure.""")
             logger.warning("In /optout, bot not in ping channel %s", ping_channel_id)
             return
-    client.conversations_kick(channel=ping_channel_id, user=user_id)
-    respond(f":tw_white_check_mark: Opted out of oiac pings from <#{channel_id}|>")
+    kicked = kick_safe(ping_channel_id, user_id)
+    if not kicked:
+        respond(f":tw_warning: You are not in <#{ping_channel_id}>.")
+        return
+    respond(f":tw_white_check_mark: Opted out of oiac pings from <#{channel_id}>")
     logger.info("In /optout, user %s opted out of channel %s", user_id, channel_id)
 
 @app.command("/oiac-on")
@@ -263,23 +286,25 @@ def handle_oiac_on(ack, body, command, respond):
     if len(matches) == 1:
         target_channel_id = matches[0]
         if not is_a_member_in_private(target_channel_id):
-            respond(f""":tw_warning: Either the channel <#{target_channel_id}|> is not private or you need to invite me to it.""")
+            respond(f""":tw_warning: Either the channel <#{target_channel_id}> is not private or you need to invite me to it.""")
             return
         if user_id not in members_of(target_channel_id):
-            respond(f""":tw_warning: Woah! You aren't a member of <#{target_channel_id}|>.""")
+            respond(f""":tw_warning: Woah! You aren't a member of <#{target_channel_id}>.""")
             logger.warning("In /oiac-on, user %s not in target channel %s", user_id, target_channel_id)
             return
         if channel_creator_of(target_channel_id) not in [self_user_id, user_id]:
-            respond(f""":tw_warning: You (or I) need to have created <#{target_channel_id}|>.""")
+            respond(f""":tw_warning: You (or I) need to have created <#{target_channel_id}>.""")
+            return
         with db_connect(db_url) as db:
-            connection = db.query_first_or_default(
+            connection = db.query_single_or_default(
                 "SELECT main_chan_id, ping_chan_id FROM connections WHERE ping_chan_id = ?channel_id?",
                 param={"channel_id": target_channel_id},
                 model=Connection,
                 default=None
             )
             if connection is not None:
-                respond(f""":tw_warning: <#{target_channel_id}|> is already taken!""")
+                respond(f""":tw_warning: <#{target_channel_id}> is already taken!""")
+                return
     elif len(matches) > 1:
         respond(":tw_warning: Please specify only one channel.")
         return
@@ -321,7 +346,7 @@ If you meant to use an already existing channel, please mention it instead.""")
         )
     say(target_channel_id, f":tw_information_source: This channel is now used for oiac pings from <#{channel_id}>. Enabled by <@{user_id}>.")
     invite_safe(target_channel_id, user_id)
-    respond(f":tw_white_check_mark: oiac is now ON. Pings will be sent via <#{target_channel_id}|>.")
+    respond(f":tw_white_check_mark: oiac is now ON. Pings will be sent via <#{target_channel_id}>.")
     logger.info("In /oiac-on, user %s enabled oiac for channel %s with ping channel %s", user_id, channel_id, target_channel_id)
 
 @app.command("/oiac-off")
@@ -333,7 +358,7 @@ def handle_oiac_off(ack, body, command, respond):
     self_user_id = client.auth_test()["user_id"]
     assert self_user_id is not None
     if not has_ping_manager_perm(channel_id, user_id):
-        respond(":tw_warning: You must be a ping manager to enable oiac.")
+        respond(":tw_warning: You must be a ping manager to disable oiac.")
         return
     with db_connect(db_url) as db:
         connection = db.query_single_or_default(
@@ -351,7 +376,7 @@ def handle_oiac_off(ack, body, command, respond):
                 channel=ping_channel_id
             )
         except SlackApiError:
-            respond(f":tw_interrobang: Huh?! The associated ping channel <#{ping_channel_id}|> doesn't seem to exist.")
+            respond(f":tw_interrobang: Huh?! The associated ping channel <#{ping_channel_id}> doesn't seem to exist.")
             logger.warning("In /oiac-off, ping channel %s does not exist", ping_channel_id)
             return
         if not is_a_member_in_private(ping_channel_id):
@@ -389,11 +414,12 @@ def handle_oiac(ack, body, command, respond):
     if not is_a_member_in_private(ping_channel_id):
         respond(f""":tw_interrobang: Huh?! I don't seem to be in <#{ping_channel_id}>.""")
         logger.warning("In /oiac, bot not in ping channel %s", ping_channel_id)
+        return
     if not has_ping_perm(channel_id, user_id):
         respond(":tw_warning: You must be a pinger to send pings.")
         return
     x = say_custom(channel_id, text, user_id)
-    ref = f"https://hackclub.slack.com/archives/{x['channel']}/p{x['ts'].replace('.', '')}" # type: ignore
+    ref = f"https://{domain}.slack.com/archives/{x['channel']}/p{x['ts'].replace('.', '')}" # type: ignore
     ping(app, ping_channel_id, ref)
     logger.info("In /oiac, user %s sent ping from channel %s with ref %s", user_id, channel_id, ref)
 
