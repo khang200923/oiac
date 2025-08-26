@@ -115,7 +115,8 @@ cd oiac
                 "groups:write",
                 "im:read",
                 "mpim:read",
-                "users:read"
+                "users:read",
+                "team:read"
             ]
         }
     },
