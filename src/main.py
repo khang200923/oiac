@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import random
+from functools import lru_cache
 from traceback import format_exc
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -25,12 +26,19 @@ if not all(env in os.environ for env in required_envs):
     missing = [env for env in required_envs if env not in os.environ]
     raise EnvironmentError(f"Missing required environment variable(s): {', '.join(missing)}")
 
-db_url = os.getenv("DATABASE_URL")
+db_url = os.environ["DATABASE_URL"]
+channel_pattern = re.compile(r"<#(C\w+)(?:\|[^>]*)?>")
+user_pattern = re.compile(r"<@(U\w+)(?:\|[^>]*)?>")
 
 @dataclass
 class Connection:
     main_chan_id: str
     ping_chan_id: str
+
+@dataclass
+class ChanUserRel:
+    chan_id: str
+    user_id: str
 
 app = App()
 client = app.client
@@ -83,6 +91,7 @@ def members_of(channel_id: str) -> list[str]:
             break
     return members
 
+@lru_cache(maxsize=128)
 def channel_creator_of(channel_id: str) -> str:
     info = client.conversations_info(
         channel=channel_id
@@ -90,6 +99,42 @@ def channel_creator_of(channel_id: str) -> str:
     channel = info["channel"]
     assert channel is not None
     return channel.get("creator", "")
+
+def has_ping_perm(channel_id: str, user_id: str) -> bool:
+    with db_connect(db_url) as db:
+        rel = db.query_single_or_default(
+            "SELECT chan_id, user_id FROM pingers WHERE chan_id = ?channel_id? AND user_id = ?user_id?",
+            param={"channel_id": channel_id, "user_id": user_id},
+            model=ChanUserRel,
+            default=None
+        )
+        if rel is not None:
+            return True
+    if channel_creator_of(channel_id) == user_id:
+        db.execute(
+            "INSERT INTO pingers (chan_id, user_id) VALUES (?channel_id?, ?user_id?)",
+            param={"channel_id": channel_id, "user_id": user_id}
+        )
+        return True
+    return False
+
+def has_ping_manager_perm(channel_id: str, user_id: str) -> bool:
+    with db_connect(db_url) as db:
+        rel = db.query_single_or_default(
+            "SELECT chan_id, user_id FROM ping_managers WHERE chan_id = ?channel_id? AND user_id = ?user_id?",
+            param={"channel_id": channel_id, "user_id": user_id},
+            model=ChanUserRel,
+            default=None
+        )
+        if rel is not None:
+            return True
+    if channel_creator_of(channel_id) == user_id:
+        db.execute(
+            "INSERT INTO ping_managers (chan_id, user_id) VALUES (?channel_id?, ?user_id?)",
+            param={"channel_id": channel_id, "user_id": user_id}
+        )
+        return True
+    return False
 
 def say(channel_id: str, text: str):
     return client.chat_postMessage(
@@ -140,7 +185,6 @@ def check_postgres(connection_string: str) -> bool:
 @wrapper
 def handle_optin(ack, body, command, respond):
     ack()
-    assert db_url is not None, "DATABASE_URL is not set"
     user_id = body["user_id"]
     channel_id = body["channel_id"]
     self_user_id = client.auth_test()["user_id"]
@@ -169,7 +213,6 @@ Either someone kicked me out or there's a catastrophic failure.""")
 @wrapper
 def handle_optout(ack, body, command, respond):
     ack()
-    assert db_url is not None, "DATABASE_URL is not set"
     user_id = body["user_id"]
     channel_id = body["channel_id"]
     self_user_id = client.auth_test()["user_id"]
@@ -198,15 +241,14 @@ Either someone kicked me out or there's a catastrophic failure.""")
 @wrapper
 def handle_oiac_on(ack, body, command, respond):
     ack()
-    assert db_url is not None, "DATABASE_URL is not set"
     user_id = body["user_id"]
     channel_id = body["channel_id"]
     self_user_id = client.auth_test()["user_id"]
     assert self_user_id is not None
     target_channel_id = None
-    matches = re.findall(r"<#(C\w+[^>|]*)(?:\|[^>]*)?>", command["text"])
-    if channel_creator_of(channel_id) != user_id:
-        respond(":tw_warning: You must be a channel creator to enable oiac.")
+    matches = re.findall(channel_pattern, command["text"])
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to enable oiac.")
         return
     with db_connect(db_url) as db:
         connection = db.query_single_or_default(
@@ -286,13 +328,12 @@ If you meant to use an already existing channel, please mention it instead.""")
 @wrapper
 def handle_oiac_off(ack, body, command, respond):
     ack()
-    assert db_url is not None, "DATABASE_URL is not set"
     user_id = body["user_id"]
     channel_id = body["channel_id"]
     self_user_id = client.auth_test()["user_id"]
     assert self_user_id is not None
-    if channel_creator_of(channel_id) != user_id:
-        respond(":tw_warning: You must be a channel creator to enable oiac.")
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to enable oiac.")
         return
     with db_connect(db_url) as db:
         connection = db.query_single_or_default(
@@ -329,7 +370,6 @@ Either someone kicked me out or there's a catastrophic failure.""")
 @wrapper
 def handle_oiac(ack, body, command, respond):
     ack()
-    assert db_url is not None, "DATABASE_URL is not set"
     user_id = body["user_id"]
     channel_id = body["channel_id"]
     self_user_id = client.auth_test()["user_id"]
@@ -349,16 +389,170 @@ def handle_oiac(ack, body, command, respond):
     if not is_a_member_in_private(ping_channel_id):
         respond(f""":tw_interrobang: Huh?! I don't seem to be in <#{ping_channel_id}>.""")
         logger.warning("In /oiac, bot not in ping channel %s", ping_channel_id)
-    if channel_creator_of(channel_id) != user_id:
-        respond(":tw_warning: You must be a channel creator to use oiac.")
+    if not has_ping_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a pinger to send pings.")
         return
     x = say_custom(channel_id, text, user_id)
     ref = f"https://hackclub.slack.com/archives/{x['channel']}/p{x['ts'].replace('.', '')}" # type: ignore
     ping(app, ping_channel_id, ref)
     logger.info("In /oiac, user %s sent ping from channel %s with ref %s", user_id, channel_id, ref)
 
+@app.command("/oiac-add-pinger")
+@wrapper
+def handle_oiac_add_pinger(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    matches = re.findall(user_pattern, command["text"])
+    logger.debug(command["text"])
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to add pingers.")
+        return
+    if len(matches) != 1:
+        respond(":tw_warning: Please mention exactly one user to add as a pinger.")
+        return
+    new_pinger_id = matches[0]
+    with db_connect(db_url) as db:
+        if has_ping_perm(channel_id, new_pinger_id):
+            respond(f":tw_warning: <@{new_pinger_id}> is already a pinger.")
+            return
+        db.execute(
+            "INSERT INTO pingers (chan_id, user_id) VALUES (?channel_id?, ?user_id?)",
+            param={"channel_id": channel_id, "user_id": new_pinger_id}
+        )
+    respond(f":tw_white_check_mark: Added <@{new_pinger_id}> as a pinger.")
+    logger.info("In /oiac-add-pinger, user %s added pinger %s for channel %s", user_id, new_pinger_id, channel_id)
+
+@app.command("/oiac-remove-pinger")
+@wrapper
+def handle_oiac_remove_pinger(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    matches = re.findall(user_pattern, command["text"])
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to remove pingers.")
+        return
+    if len(matches) != 1:
+        respond(":tw_warning: Please mention exactly one user to remove as a pinger.")
+        return
+    remove_pinger_id = matches[0]
+    with db_connect(db_url) as db:
+        if not has_ping_perm(channel_id, remove_pinger_id):
+            respond(f":tw_warning: <@{remove_pinger_id}> is not a pinger.")
+            return
+        if channel_creator_of(channel_id) == remove_pinger_id:
+            respond(f":tw_warning: You cannot remove the channel creator <@{remove_pinger_id}> as a pinger.")
+            return
+        db.execute(
+            "DELETE FROM pingers WHERE chan_id = ?channel_id? AND user_id = ?user_id?",
+            param={"channel_id": channel_id, "user_id": remove_pinger_id}
+        )
+    respond(f":tw_white_check_mark: Removed <@{remove_pinger_id}> as a pinger.")
+    logger.info("In /oiac-remove-pinger, user %s removed pinger %s for channel %s", user_id, remove_pinger_id, channel_id)
+
+@app.command("/oiac-list-pingers")
+@wrapper
+def handle_oiac_list_pingers(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    with db_connect(db_url) as db:
+        pingers = db.query(
+            "SELECT chan_id, user_id FROM pingers WHERE chan_id = ?channel_id?",
+            param={"channel_id": channel_id},
+            model=ChanUserRel
+        )
+        pingers = [x.user_id for x in pingers]
+        pingers.append(channel_creator_of(channel_id))
+        pingers = set(pingers)
+        pinger_mentions = [f"<@{p}>" for p in pingers]
+        respond(":tw_information_source: Pingers for this channel:\n" + "\n".join(pinger_mentions))
+
+@app.command("/oiac-add-manager")
+@wrapper
+def handle_oiac_add_manager(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    matches = re.findall(user_pattern, command["text"])
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to add ping managers.")
+        return
+    if len(matches) != 1:
+        respond(":tw_warning: Please mention exactly one user to add as a ping manager.")
+        return
+    new_manager_id = matches[0]
+    with db_connect(db_url) as db:
+        if has_ping_manager_perm(channel_id, new_manager_id):
+            respond(f":tw_warning: <@{new_manager_id}> is already a ping manager.")
+            return
+        db.execute(
+            "INSERT INTO ping_managers (chan_id, user_id) VALUES (?channel_id?, ?user_id?)",
+            param={"channel_id": channel_id, "user_id": new_manager_id}
+        )
+    respond(f":tw_white_check_mark: Added <@{new_manager_id}> as a ping manager.")
+    logger.info("In /oiac-add-manager, user %s added ping manager %s for channel %s", user_id, new_manager_id, channel_id)
+
+@app.command("/oiac-remove-manager")
+@wrapper
+def handle_oiac_remove_manager(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    matches = re.findall(user_pattern, command["text"])
+    if not has_ping_manager_perm(channel_id, user_id):
+        respond(":tw_warning: You must be a ping manager to remove ping managers.")
+        return
+    if len(matches) != 1:
+        respond(":tw_warning: Please mention exactly one user to remove as a ping manager.")
+        return
+    remove_manager_id = matches[0]
+    with db_connect(db_url) as db:
+        if not has_ping_manager_perm(channel_id, remove_manager_id):
+            respond(f":tw_warning: <@{remove_manager_id}> is not a ping manager.")
+            return
+        if channel_creator_of(channel_id) == remove_manager_id:
+            respond(f":tw_warning: You cannot remove the channel creator <@{remove_manager_id}> as a ping manager.")
+            return
+        db.execute(
+            "DELETE FROM ping_managers WHERE chan_id = ?channel_id? AND user_id = ?user_id?",
+            param={"channel_id": channel_id, "user_id": remove_manager_id}
+        )
+    respond(f":tw_white_check_mark: Removed <@{remove_manager_id}> as a ping manager.")
+    logger.info("In /oiac-remove-manager, user %s removed ping manager %s for channel %s", user_id, remove_manager_id, channel_id)
+
+@app.command("/oiac-list-managers")
+@wrapper
+def handle_oiac_list_managers(ack, body, command, respond):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    self_user_id = client.auth_test()["user_id"]
+    assert self_user_id is not None
+    with db_connect(db_url) as db:
+        managers = db.query(
+            "SELECT chan_id, user_id FROM ping_managers WHERE chan_id = ?channel_id?",
+            param={"channel_id": channel_id},
+            model=ChanUserRel
+        )
+        managers = [x.user_id for x in managers]
+        managers.append(channel_creator_of(channel_id))
+        managers = set(managers)
+        manager_mentions = [f"<@{p}>" for p in managers]
+        respond(":tw_information_source: Ping managers for this channel:\n" + "\n".join(manager_mentions))
+
 def main():
-    assert db_url is not None, "DATABASE_URL is not set"
     if not check_postgres(db_url):
         logger.critical("Cannot connect to PostgreSQL database. Exiting.")
         return
