@@ -149,14 +149,9 @@ OWNER_ID=U...
 LOG_FILE=...
 ```
 
-5. Initialize the database
+5. Initialize and run the bot
 
 ```bash
 bash init.sh
-```
-
-6. Run the bot
-
-```bash
 bash run.sh
 ```
