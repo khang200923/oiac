@@ -10,5 +10,5 @@ then
     exit 1
 fi
 
-psql $DATABASE_URL < migrations/down.sql
-psql $DATABASE_URL < migrations/up.sql
+psql "$DATABASE_URL" < migrations/down.sql
+psql "$DATABASE_URL" < migrations/up.sql
