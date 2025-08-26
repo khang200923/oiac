@@ -6,6 +6,21 @@ There's a common problem on Hack Club Slack: [at-channel](https://github.com/Sky
 
 Since @channel pings don't have this ping-on-reply feature, oiac uses @channel pings on opted-in users only, by sending @channel in separate channels. This solves both problems at once.
 
+## Commands
+
+- `/oiac` - Ping opted-in users using @channel
+- `/optin` - Opt-in to oiac pings on this channel
+- `/optout` - Opt-out of oiac pings on this channel
+- `/oiac-on [ping channel name]` - Turns oiac on for this channel
+- `/oiac-off` - Turns oiac off for this channel
+
+- `/oiac-add-pinger [user]` - Add an oiac pinger
+- `/oiac-remove-pinger [user]` - Remove an oiac pinger
+- `/oiac-list-pingers` - List all oiac pingers in this channel
+- `/oiac-add-manager [user]` - Add an oiac manager
+- `/oiac-remove-manager [user]` - Remove an oiac manager
+- `/oiac-list-managers` - List all oiac managers in this channel
+
 ## Setup
 
 ### Prerequisites
